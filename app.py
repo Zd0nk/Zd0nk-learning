@@ -885,9 +885,21 @@ def compute_expected_pts(df):
     cs_pts   = df["position"].map({"GKP": 4, "DEF": 4, "MID": 1, "FWD": 0}).fillna(0)
     gc_pen   = df["position"].map({"GKP": -0.5, "DEF": -0.5, "MID": 0, "FWD": 0}).fillna(0)
 
+    # ── Appearance points (1pt any appearance, +1pt if 60+ mins) ──
+    # Instead of a flat 2.0, estimate the probability of playing
+    # 60+ minutes when the player does appear. Use average minutes
+    # per game as a proxy:
+    #   avg_mpg >= 60  →  full 2 pts (nailed starter)
+    #   avg_mpg  < 60  →  1 + (avg_mpg / 60) pts (sub/rotation)
+    # This means a player who averages 30 mins per appearance gets
+    # 1.5 appearance pts, while a regular 90-min starter gets 2.0.
+    avg_mpg = _safe(df, "minutes_per_game")
+    full_60_prob = (avg_mpg / 60.0).clip(0.0, 1.0)
+    appearance_pts = 1.0 + full_60_prob  # 1pt base + up to 1pt for 60+ mins
+
     # ── Expected FPL points per match (when playing) ──
     xPts_if_playing = (
-        2.0                         # appearance points (assume >60 mins)
+        appearance_pts                # appearance points (refined 1pt + 60min bonus)
         + goal_pts * xg             # expected goal points
         + 3.0 * xa                  # expected assist points (3pts all positions)
         + cs_pts * cs_prob          # expected clean sheet points
@@ -900,7 +912,8 @@ def compute_expected_pts(df):
 
     # ── Discount by start probability ─────────────────────────
     # xPts represents the EXPECTED points per GW, accounting for
-    # the chance the player doesn't play at all.
+    # the chance the player doesn't play at all. Used by the
+    # transfer engine to compare a nailed starter vs rotation risk.
     xPts = xPts_if_playing * start_prob
 
     # Fixture difficulty adjustment: scale by fixture_score
@@ -913,13 +926,18 @@ def compute_expected_pts(df):
 
     xPts_adjusted = xPts * fix_mult
 
-    # v5.5: No ep_next blending — xPts is now purely driven by
-    # Understat/FBref underlying stats + FPL scoring rules.
-    # Injury/availability is captured by start_prob and risk flags.
+    # v5.6: Two xPts views:
+    #   xPts          = "if playing" figure (fixture-adjusted, NOT discounted
+    #                    by start_prob). This is what users see in the squad
+    #                    view and captain picks — "how many points will this
+    #                    player get IF they play this GW?"
+    #   fpl_value_score = probability-weighted (fixture-adjusted × start_prob).
+    #                    This is what the transfer engine ranks by, since it
+    #                    needs to account for the risk of a player not playing.
 
-    df["xPts"]            = xPts.round(2)
-    df["xPts_adjusted"]   = xPts_adjusted.round(2)
-    df["fpl_value_score"] = xPts_adjusted  # this is what the transfer engine ranks by
+    df["xPts"]             = (xPts_if_playing * fix_mult).round(2)  # if-playing view
+    df["xPts_adjusted"]    = xPts_adjusted.round(2)                 # weighted view
+    df["fpl_value_score"]  = xPts_adjusted  # transfer engine ranks by this
 
     return df
 
@@ -1047,30 +1065,35 @@ def compute_gw_projected_pts(squad_df, target_gw, fixtures):
             continue
 
         pos = p.get("position", "")
+
+        # GKPs should never be captain — skip them
+        if pos == "GKP":
+            proj_pts.append(0.0)
+            continue
+
         fm  = float(p["fix_multiplier"])
-        sp  = float(p["start_prob"])
         cs  = float(p.get("cs_prob",     0.25))
         xg  = float(p.get("xg_p90",     0.0))
         xa  = float(p.get("xa_p90",     0.0))
         dc  = float(p.get("dc_hit_rate", 0.0))
-        sv  = float(p.get("saves",       0.0))
-        sm  = max(float(p.get("minutes", 90.0)), 450.0)  # stabilise like main model
 
-        saves_p90 = sv / sm * 90.0
+        # Appearance points: 1pt base + probability of 60+ mins
+        avg_mpg = float(p.get("minutes_per_game", 90.0))
+        full_60_prob = min(max(avg_mpg / 60.0, 0.0), 1.0)
+        app_pts = 1.0 + full_60_prob
 
-        # ──────────────────────────────────────────────────────
-        # v5.2 CORRECTED: CS = 4pts for GKP/DEF (was 6 in v5.1)
-        # ──────────────────────────────────────────────────────
-        if pos == "GKP":
-            base = (cs * 4.0) + (saves_p90 / 3.0) + 2.0
-        elif pos == "DEF":
-            base = (cs * 4.0) + (xg * 6.0) + (xa * 3.0) + (dc * 2.0) + 2.0
+        # v5.6: Captain projections use "if playing" figure — no
+        # start_prob discount. You pick a captain from players you
+        # expect to start, so the question is "how much will they
+        # score when they play", not "will they play at all".
+        if pos == "DEF":
+            base = (cs * 4.0) + (xg * 6.0) + (xa * 3.0) + (dc * 2.0) + app_pts
         elif pos == "MID":
-            base = (cs * 1.0) + (xg * 5.0) + (xa * 3.0) + (dc * 2.0) + 2.0
+            base = (cs * 1.0) + (xg * 5.0) + (xa * 3.0) + (dc * 2.0) + app_pts
         else:   # FWD
-            base = (xg * 4.0) + (xa * 3.0) + 2.0
+            base = (xg * 4.0) + (xa * 3.0) + app_pts
 
-        proj_pts.append(base * fm * sp)
+        proj_pts.append(base * fm)
 
     df["gw_proj_pts"] = proj_pts
     return df
